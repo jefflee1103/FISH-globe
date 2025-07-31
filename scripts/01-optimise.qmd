@@ -25,7 +25,7 @@ gtf_basename <- basename(gtf_url)
 ## download and read gtf - valr can handle gz-zipped files (valr reads 0-based coordinates)
 gtf_path <- file.path(tempdir(), gtf_basename)
 download.file(gtf_url, gtf_path)
-gtf <- read_gtf(gtf_path)
+gtf <- import_gtf(gtf_path)
 
 ## filter out non-relevant genes
 biotypes_to_use <- c("protein_coding", "ncRNA", "rRNA")
@@ -212,7 +212,7 @@ pcnc_list$FBgn0000024$sliding_window_thermo %>% View()
 
 qsave(pcnc_list, "./data/Dmel/pcnc_list_post-thermo-calculation.qs")
 
-
+names(pcnc_list)
 
 ```
 
