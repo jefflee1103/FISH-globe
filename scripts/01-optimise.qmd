@@ -17,7 +17,14 @@ library(qs)
 library(valr)
 library(furrr)
 plan(multisession, workers = 8)
+source("./src/misc.R")
 
+## helper function for creading sliding window (also allows window over exon-exon junctions)
+source("./src/make_slidingwindow.R")
+
+```
+
+```{r}
 ## url from ensembl
 gtf_url <- "https://ftp.ensembl.org/pub/release-114/gtf/drosophila_melanogaster/Drosophila_melanogaster.BDGP6.54.114.gtf.gz"
 gtf_basename <- basename(gtf_url)
@@ -68,9 +75,6 @@ pcnc_list <- pcnc_list %>%
     return(output)
   })
 
-## helper function for creading sliding window (also allows window over exon-exon junctions)
-source("./src/make_slidingwindow.R")
-
 ## create sliding window coordinates (exon-spanning junctions occur as sepaerate rows) and append to the list
 pcnc_list <- pcnc_list[1:10] %>%
   future_map(~{
@@ -105,14 +109,35 @@ pcnc_list <- pcnc_list[1:10] %>%
 ### Get sequence for each window and merge junction-spanning sequences 
 
 ```{r}
-## bedtools wrapper 
-library(bedtoolsr)
+library(tidyverse)
+library(qs)
+library(valr)
+library(furrr)
+plan(multisession, workers = 8)
+source("./src/misc.R")
 
+require(biomaRt)
+require(biomartr)
+library(bedtoolsr)
+```
+
+```{r}
 ## check bedtools installation
-conda_bedtools_bin <- "/opt/miniconda3/envs/bedtools/bin" # find this directory
-Sys.setenv(PATH = paste(Sys.getenv("PATH"), conda_bedtools_bin, sep = .Platform$path.sep))
-Sys.getenv("PATH")
-Sys.which("bedtools")
+conda_bedtools_path <- "/opt/miniconda3/envs/bedtools/bin/"
+
+## For wsl
+# conda_bedtools_path <- "wsl /home/jefflee/miniconda3/envs/bedtools/bin/"
+
+# conda_bedtools_bin <- "/opt/miniconda3/envs/bedtools/bin" # find this directory
+# Sys.setenv(PATH = paste(Sys.getenv("PATH"), conda_bedtools_bin, sep = .Platform$path.sep))
+# Sys.getenv("PATH")
+# Sys.which("bedtools")
+
+## Test bedtools installation
+# options(bedtools.path = conda_bedtools_path)
+# A.bed <- data.frame(chrom=c("chr1", "chr1"), start=c(10, 30), end=c(20, 40))
+# B.bed <- data.frame(chrom=c("chr1"), start=15, end=20)
+# bedtoolsr::bt.intersect(A.bed, B.bed)
 
 ## get fasta file
 release_version <- 114
@@ -185,10 +210,19 @@ pcnc_list <- pcnc_list %>%
 ### Get thermodynamics parameters for each sliding window
 
 ```{r}
-library(Rcpp)
+library(tidyverse)
+library(qs)
+library(valr)
+library(furrr)
+plan(multisession, workers = 8)
 source("./src/misc.R")
+
+library(Rcpp)
 source("./src/thermodynamics.R")
 
+```
+
+```{r}
 temperature <- 37
 Na <- 0.3
 oligo_conc <- 5e-5
@@ -212,7 +246,6 @@ pcnc_list$FBgn0000024$sliding_window_thermo %>% View()
 
 qsave(pcnc_list, "./data/Dmel/pcnc_list_post-thermo-calculation.qs")
 
-names(pcnc_list)
 
 ```
 
