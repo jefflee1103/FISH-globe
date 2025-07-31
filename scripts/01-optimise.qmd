@@ -1,0 +1,222 @@
+---
+title: "Untitled"
+format: html
+---
+
+# 01-optimise
+Quarto notebook for optimising GTF handling
+Last updated: 2025-07-28
+
+## GTF handling
+
+### Download GTF from ensembl
+
+```{r}
+library(tidyverse)
+library(qs)
+library(valr)
+library(furrr)
+plan(multisession, workers = 8)
+
+## url from ensembl
+gtf_url <- "https://ftp.ensembl.org/pub/release-114/gtf/drosophila_melanogaster/Drosophila_melanogaster.BDGP6.54.114.gtf.gz"
+gtf_basename <- basename(gtf_url)
+
+## download and read gtf - valr can handle gz-zipped files (valr reads 0-based coordinates)
+gtf_path <- file.path(tempdir(), gtf_basename)
+download.file(gtf_url, gtf_path)
+gtf <- read_gtf(gtf_path)
+
+## filter out non-relevant genes
+biotypes_to_use <- c("protein_coding", "ncRNA", "rRNA")
+
+gtf_pcnc <- gtf %>%
+    filter(gene_biotype %in% biotypes_to_use)
+
+## how many genes have both +/- strand attributes? - FBgn0002781 mod(mdg4) is the only one. Ignore this outlier exon.
+## This is not present in the latest v114 version
+strand_test_df <- gtf_pcnc %>%
+  filter(type == "exon") %>%
+  group_by(gene_id) %>%
+  summarise(strand = unique(strand) %>% sort() %>% paste0(collapse = ""))
+
+```
+
+### Get sliding windows for each gene
+
+```{r}
+## split into list for each gene
+pcnc_list <- gtf_pcnc %>%
+  split(gtf_pcnc$gene_id)
+
+pcnc_list <- pcnc_list %>%
+  future_imap(~{
+    exon_intervals <- .x %>% filter(type == "exon")
+    isoform_count <- unique(exon_intervals$transcript_id) %>% length()
+    strand <- unique(exon_intervals$strand) %>% unique()
+    
+    output <- list(
+      gene_id = .y,
+      gene_name = unique(exon_intervals$gene_name),
+      gene_biotype = unique(exon_intervals$gene_biotype),
+      exon_intervals = exon_intervals,
+      isoform_count = isoform_count,
+      strand = strand,
+      gtf_version = gtf_url
+    )
+    
+    return(output)
+  })
+
+## helper function for creading sliding window (also allows window over exon-exon junctions)
+source("./src/make_slidingwindow.R")
+
+## create sliding window coordinates (exon-spanning junctions occur as sepaerate rows) and append to the list
+pcnc_list <- pcnc_list[1:10] %>%
+  future_map(~{
+    .x$sliding_window_info <- .x$exon_intervals %>%
+      ungroup() %>%
+      dplyr::select(chrom, start, end, strand, gene_id, transcript_id, transcript_name) %>%
+      group_by(gene_id, transcript_id, transcript_name) %>%
+      nest() %>% 
+      mutate(
+          window_data = map(data, ~make_slidingwindow(
+              exons = .x,
+              window_width = 52,
+              window_step = 1
+          ))
+      ) %>%
+      dplyr::select(gene_id, transcript_id, transcript_name, window_data) %>%
+      unnest(cols = c(window_data)) %>%
+      ungroup() %>%
+      group_by(across(c(-transcript_id, -transcript_name))) %>%
+      dplyr::summarise(
+        transcript_ids = str_c(transcript_id, collapse = ":"),
+        transcript_names = str_c(transcript_name, collapse = ":")
+      ) %>%
+      ungroup() %>%
+      mutate(across(where(is.numeric), as.integer))
+
+    return(.x)
+  })
+
+```
+
+### Get sequence for each window and merge junction-spanning sequences 
+
+```{r}
+## bedtools wrapper 
+library(bedtoolsr)
+
+## check bedtools installation
+conda_bedtools_bin <- "/opt/miniconda3/envs/bedtools/bin" # find this directory
+Sys.setenv(PATH = paste(Sys.getenv("PATH"), conda_bedtools_bin, sep = .Platform$path.sep))
+Sys.getenv("PATH")
+Sys.which("bedtools")
+
+## get fasta file
+release_version <- 114
+
+fasta_file <- biomartr::getGenome(
+  db = "ensembl",
+  organism = "Drosophila melanogaster",
+  release = release_version,
+  gunzip = TRUE,
+  path = tempdir(),
+)
+
+pcnc_list <- pcnc_list %>%
+  map(~ {
+    if (nrow(.x$sliding_window_info) > 0) {
+      bed_touse <- .x$sliding_window_info %>%
+        # dplyr::mutate(name = str_c(chrom, start, end, strand, sep = ":")) %>%
+        dplyr::select(chrom, start, end, "name" = unique_window_id, "score" = spans_junction, strand)
+
+      getfasta_output <- bedtoolsr::bt.getfasta(
+        fi = fasta_file,
+        bed = bed_touse,
+        bedOut = TRUE,
+        s = TRUE
+      ) %>%
+        as_tibble() %>%
+        setNames(c("chrom", "start", "end", "unique_window_id", "spans_junction", "strand", "seq")) %>%
+        ungroup() %>%
+        group_by(unique_window_id) %>% 
+        arrange(if_else(strand == "-", -start, start), .by_group = TRUE) %>%
+        summarise(
+          target_sequence = paste0(seq, collapse = "")
+        ) %>% ungroup()
+
+      .x$sliding_window_seq <- left_join(
+        (
+          .x$sliding_window_info %>%
+            dplyr::select(gene_id, unique_window_id, transcript_ids, transcript_names, spans_junction) %>%
+            distinct()
+          ),
+        (
+          getfasta_output
+          ),
+        by = "unique_window_id"
+      )
+      
+      return(.x)
+    } else {
+      # .x$sliding_window_seq <- tibble(
+      #   chrom = character(),
+      #   start = numeric(),
+      #   end = numeric(),
+      #   width = numeric(),
+      #   strand = character(),
+      #   seq = character(),
+      #   nchar_plus_N_cumsum = numeric()
+      # )
+      .x$sliding_window_seq <- NULL
+      
+      return(.x)
+    }
+  }, .progress = TRUE)
+
+# a$FBgn0000018$sliding_window_seq %>% View()
+
+```
+
+## Thermodynamics 
+
+### Get thermodynamics parameters for each sliding window
+
+```{r}
+library(Rcpp)
+source("./src/misc.R")
+source("./src/thermodynamics.R")
+
+temperature <- 37
+Na <- 0.3
+oligo_conc <- 5e-5
+
+pcnc_list <- pcnc_list %>%
+  map(~{
+    if(!is.null(.x$sliding_window_seq)){
+      candidate_probes <- .x$sliding_window_seq %>%
+        dplyr::select(unique_window_id, target_sequence)
+      thermodynamics <- get_thermodynamic_parameters(candidate_probes, temperature, Na, oligo_conc)
+      .x$sliding_window_thermo <- annotate_probes(candidate_probes, thermodynamics)
+      return(.x)
+    }
+    else {
+      .x$sliding_window_thermo <- NULL
+      return(.x)
+    }
+  }, .progress = TRUE)
+
+pcnc_list$FBgn0000024$sliding_window_thermo %>% View()
+
+qsave(pcnc_list, "./data/Dmel/pcnc_list_post-thermo-calculation.qs")
+
+
+
+```
+
+```{r}
+
+
+```
